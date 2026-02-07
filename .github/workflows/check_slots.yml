@@ -23,13 +23,23 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          playwright install chromium
-          playwright install-deps chromium
+          playwright install firefox
+          playwright install-deps firefox
+
+      - name: Restore browser session
+        env:
+          BROWSER_STATE_BASE64: ${{ secrets.BROWSER_STATE_BASE64 }}
+        run: |
+          if [ -n "$BROWSER_STATE_BASE64" ]; then
+            echo "$BROWSER_STATE_BASE64" | base64 -d > browser_state.json
+            echo "✅ Browser session restored"
+          else
+            echo "⚠️  No browser session found - will attempt automated login"
+          fi
 
       - name: Check for available slots
         env:
           USER_EMAIL: ${{ secrets.USER_EMAIL }}
-          USER_PASSWORD: ${{ secrets.USER_PASSWORD }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_PERSONAL_CHAT_ID: ${{ secrets.TELEGRAM_PERSONAL_CHAT_ID }}
           TELEGRAM_GROUP_CHAT_ID: ${{ secrets.TELEGRAM_GROUP_CHAT_ID }}
