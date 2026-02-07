@@ -73,6 +73,7 @@ def login_with_playwright():
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
         import os.path
+        import time
 
         print("🔐 Logging in with Playwright...")
 
@@ -80,13 +81,8 @@ def login_with_playwright():
         TOKEN_FILE = "access_token.txt"
         use_saved_session = os.path.exists(STORAGE_FILE)
 
-        # Try to load saved access token
-        if os.path.exists(TOKEN_FILE):
-            with open(TOKEN_FILE, 'r') as f:
-                saved_token = f.read().strip()
-                if saved_token:
-                    access_token = saved_token
-                    print(f"📦 Loaded saved access token from {TOKEN_FILE}")
+        # Tokens expire very quickly (1-2 minutes), so don't use saved tokens
+        # Always get a fresh token with browser session
 
         if use_saved_session:
             print(f"📦 Using saved session from {STORAGE_FILE}")
@@ -131,85 +127,37 @@ def login_with_playwright():
                 });
             """)
 
-            # Intercept API responses to capture the access token
+            # Intercept API requests to capture the access token from headers
             access_token = None
 
-            def handle_response(response):
+            def handle_request(request):
                 nonlocal access_token
-                if "user/login" in response.url and response.status == 200:
-                    try:
-                        data = response.json()
-                        if data.get('accessToken'):
-                            access_token = data['accessToken']
-                            print("✅ Access token captured from API response")
-                    except:
-                        pass
+                # Capture authorization header from any API request
+                if "lift-api.vfsglobal.com" in request.url or "litf-api.vfsglobal.com" in request.url:
+                    if not access_token:
+                        print(f"🔍 Checking API request: {request.url}")
+                        auth_header = request.headers.get('authorize') or request.headers.get('authorization')
+                        if auth_header:
+                            access_token = auth_header.replace('Bearer ', '').strip()
+                            print(f"✅ Access token captured from request header (length: {len(access_token)})")
+                        else:
+                            print(f"   ⚠️  No auth header in this request")
 
-            page.on("response", handle_response)
+            page.on("request", handle_request)
 
             if use_saved_session:
-                # With saved session, visit dashboard to trigger authentication
-                print("📄 Loading dashboard with saved session...")
+                # With saved session, visit login page to trigger API calls and capture token
+                print("📄 Loading login page with saved session...")
                 try:
-                    # Go to dashboard - should work with valid session
-                    page.goto("https://visa.vfsglobal.com/aze/en/ita/dashboard", wait_until="domcontentloaded", timeout=30000)
-                    page.wait_for_timeout(5000)
+                    # Load login page - this triggers API calls that include the auth token
+                    page.goto("https://visa.vfsglobal.com/aze/en/ita/login", wait_until="domcontentloaded", timeout=30000)
+                    page.wait_for_timeout(5000)  # Wait for API calls to complete
 
                     current_url = page.url
 
-                    # Check if we got redirected to login (session expired)
-                    if "login" in current_url:
-                        print("⚠️  Session expired - please run setup_session.py again")
-                        browser.close()
-                        return None
-
-                    print("✅ Session still valid - on dashboard")
-
-                    # Try to extract token from all possible storage locations
-                    if not access_token:
-                        print("🔍 Searching for access token in browser storage...")
-                        access_token = page.evaluate("""
-                            () => {
-                                // Check all storage locations
-                                const locations = [
-                                    localStorage.getItem('accessToken'),
-                                    localStorage.getItem('token'),
-                                    localStorage.getItem('authToken'),
-                                    localStorage.getItem('auth_token'),
-                                    localStorage.getItem('lift_token'),
-                                    sessionStorage.getItem('accessToken'),
-                                    sessionStorage.getItem('token'),
-                                    sessionStorage.getItem('authToken')
-                                ];
-
-                                // Return first non-null value
-                                for (let val of locations) {
-                                    if (val) return val;
-                                }
-
-                                // Try to find in all localStorage keys
-                                for (let i = 0; i < localStorage.length; i++) {
-                                    const key = localStorage.key(i);
-                                    if (key && key.toLowerCase().includes('token')) {
-                                        const value = localStorage.getItem(key);
-                                        if (value && value.length > 50) {  // Tokens are usually long
-                                            console.log('Found token in key:', key);
-                                            return value;
-                                        }
-                                    }
-                                }
-
-                                return null;
-                            }
-                        """)
-
-                        if access_token:
-                            print(f"✅ Token found in storage (length: {len(access_token)})")
-                        else:
-                            print("⚠️  Token not in storage, refreshing session...")
-                            # Try refreshing by visiting login again
-                            page.goto("https://visa.vfsglobal.com/aze/en/ita/login")
-                            page.wait_for_timeout(5000)
+                    # If already logged in, we'll be redirected to dashboard
+                    if "dashboard" in current_url or not "login" in current_url:
+                        print("✅ Session still valid - already logged in")
 
                 except Exception as e:
                     print(f"⚠️  Session check failed: {e}")
@@ -220,30 +168,26 @@ def login_with_playwright():
                 print("📝 Please run: python scripts/setup_session.py")
                 print("   This is a ONE-TIME setup that takes 30 seconds.")
                 browser.close()
-                return None
-
-            browser.close()
+                return (None, None, None)
 
             if access_token:
                 print("✅ Login successful - Access token obtained")
-                return access_token
+                return (page, browser, access_token)
             else:
                 print("❌ Failed to obtain access token")
-                return None
+                browser.close()
+                return (None, None, None)
 
     except ImportError:
         print("⚠️  Playwright not available")
-        return None
+        return (None, None, None)
     except Exception as e:
         print(f"❌ Playwright login error: {e}")
-        return None
+        return (None, None, None)
 
-def check_slots(access_token):
-    """Check for available visa appointment slots"""
+def check_slots_with_browser(page, access_token):
+    """Check for available visa appointment slots using the browser context"""
     print("🔍 Checking for available slots...")
-
-    headers = HEADERS.copy()
-    headers["authorize"] = access_token
 
     payload = {
         "countryCode": "aze",
@@ -256,10 +200,30 @@ def check_slots(access_token):
     }
 
     try:
-        response = requests.post(SLOT_CHECK_URL, json=payload, headers=headers, timeout=15)
+        # Make API call from within the browser context
+        result = page.evaluate("""
+            async (args) => {
+                const response = await fetch('https://lift-api.vfsglobal.com/appointment/CheckIsSlotAvailable', {
+                    method: 'POST',
+                    headers: {
+                        'accept': 'application/json, text/plain, */*',
+                        'content-type': 'application/json;charset=UTF-8',
+                        'authorize': args.token,
+                        'route': 'aze/en/ita'
+                    },
+                    body: JSON.stringify(args.payload)
+                });
 
-        if response.status_code == 200:
-            data = response.json()
+                const data = await response.json();
+                return {
+                    status: response.status,
+                    data: data
+                };
+            }
+        """, {"token": access_token, "payload": payload})
+
+        if result['status'] == 200:
+            data = result['data']
 
             # Check if slots are available
             if data.get('earliestDate') or data.get('earliestSlotLists'):
@@ -277,7 +241,8 @@ def check_slots(access_token):
                     print(f"⚠️  Unexpected response: {data}")
                     return {'available': False}
         else:
-            print(f"❌ API request failed: {response.status_code}")
+            print(f"❌ API request failed: {result['status']}")
+            print(f"   Response: {result.get('data', {})}")
             return None
 
     except Exception as e:
@@ -304,19 +269,25 @@ def main():
         print(f"❌ Error: The following environment variables must be set: {', '.join(missing_vars)}")
         sys.exit(1)
 
-    # Step 1: Login to get access token
-    access_token = login_with_playwright()
+    # Step 1: Login to get access token and browser session
+    page, browser, access_token = login_with_playwright()
 
-    if not access_token:
+    if not access_token or not page:
         print("❌ Failed to login - cannot check slots")
         sys.exit(1)
 
-    # Step 2: Check for available slots
-    result = check_slots(access_token)
+    try:
+        # Step 2: Check for available slots using the browser session
+        result = check_slots_with_browser(page, access_token)
 
-    if result is None:
-        print("❌ Failed to check slots")
-        sys.exit(1)
+        if result is None:
+            print("❌ Failed to check slots")
+            browser.close()
+            sys.exit(1)
+    finally:
+        # Always close the browser
+        if browser:
+            browser.close()
 
     # Step 3: Send notification if slots are available
     if result['available']:
